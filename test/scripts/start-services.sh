@@ -9,7 +9,7 @@ start_ganache()
     echo "Starting Ganache"
     yarn run ganache-cli \
         --port=8545 \
-        --blockTime=0 \
+        --blockTime=4 \
         --networkId=344 \
         --deterministic \
         --mnemonic='stone speak what ritual switch pigeon weird dutch burst shaft nature shove' \
@@ -41,11 +41,33 @@ start_parachain()
     pushd ../parachain
 
     cargo build
-    target/debug/artemis-node --tmp --dev >$logfile 2>&1 &
+
+    echo "Generating Parachain spec"
+    target/debug/artemis-node build-spec --dev --disable-default-bootnode > $configdir/spec.json
+
+    echo "Inserting Ganache chain info into genesis spec"
+    ethereum_initial_header=$(curl http://localhost:8545 \
+        -X POST \
+        -H "Content-Type: application/json" \
+        -d '{"jsonrpc":"2.0","method":"eth_getBlockByNumber","params": ["latest", false],"id":1}' \
+        | node ../test/scripts/helpers/transformEthHeader.js)
+    node ../test/scripts/helpers/overrideParachainSpec.js $configdir/spec.json \
+        genesis.runtime.verifierLightclient.initialDifficulty 0x0 \
+        genesis.runtime.verifierLightclient.initialHeader "$ethereum_initial_header"
+
+    target/debug/artemis-node -lruntime=debug \
+        --alice \
+        --force-authoring \
+        --tmp \
+        --rpc-port 11133 \
+        --ws-port 11144 \
+        --rpc-cors=all \
+        --chain $configdir/spec.json \
+        >$logfile 2>&1 &
 
     popd
 
-    scripts/wait-for-it.sh -t 20 localhost:9944
+    scripts/wait-for-it.sh -t 20 localhost:11144
     sleep 5
 
     echo "Parachain PID: $!"
@@ -66,6 +88,7 @@ start_relayer()
 
     popd
     echo "Relay PID: $!"
+
 }
 
 trap 'kill $(jobs -p)' SIGINT SIGTERM
@@ -75,9 +98,17 @@ deploy_contracts
 start_parachain
 start_relayer
 
-# TODO: Exit when any child process dies
-#  https://stackoverflow.com/questions/37496896/exit-a-bash-script-when-one-of-the-subprocesses-exits
-
+echo "Process Tree:"
 pstree $$
+
+until $(grep "Polling headers starting..." $(pwd)/relay.log > /dev/null); do
+    echo "Waiting for relayer to generate DAG cache..."
+    sleep 20
+done
+
+echo "Waiting for relayer to sync headers..."
+sleep 10
+
+echo "System has been initialized and E2E tests can be executed"
 
 wait

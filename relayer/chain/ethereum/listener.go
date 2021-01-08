@@ -5,7 +5,6 @@ package ethereum
 
 import (
 	"context"
-	"math/big"
 
 	geth "github.com/ethereum/go-ethereum"
 	gethCommon "github.com/ethereum/go-ethereum/common"
@@ -14,6 +13,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/snowfork/polkadot-ethereum/relayer/chain"
+	"github.com/snowfork/polkadot-ethereum/relayer/chain/ethereum/syncer"
 )
 
 // Listener streams the Ethereum blockchain for application events
@@ -35,24 +35,43 @@ func NewListener(conn *Connection, messages chan<- chain.Message, headers chan<-
 	}, nil
 }
 
-func (li *Listener) Start(cxt context.Context, eg *errgroup.Group, start *HeaderID) error {
+func (li *Listener) Start(cxt context.Context, eg *errgroup.Group, initBlockHeight uint64) error {
+	hcs, err := NewHeaderCacheState(
+		eg,
+		initBlockHeight,
+		&DefaultBlockLoader{conn: li.conn},
+		nil,
+	)
+	if err != nil {
+		return err
+	}
+
 	eg.Go(func() error {
-		return li.pollEventsAndHeaders(cxt, start)
+		return li.pollEventsAndHeaders(cxt, initBlockHeight, hcs)
 	})
 
 	return nil
 }
 
-func (li *Listener) pollEventsAndHeaders(ctx context.Context, start *HeaderID) error {
+func (li *Listener) onDone(ctx context.Context) error {
+	li.log.Info("Shutting down listener...")
+	if li.messages != nil {
+		close(li.messages)
+	}
+	close(li.headers)
+	return ctx.Err()
+}
+
+func (li *Listener) pollEventsAndHeaders(ctx context.Context, initBlockHeight uint64, hcs *HeaderCacheState) error {
 	events := make(chan gethTypes.Log)
 	var eventsSubscriptionErr <-chan error
 	headers := make(chan *gethTypes.Header, 5)
-	var headersSubscriptionErr <-chan error
+	headerEg, headerCtx := errgroup.WithContext(ctx)
 
 	if li.messages == nil {
 		li.log.Info("Not polling events since channel is nil")
 	} else {
-		li.log.Info("Polling events started")
+		li.log.Info("Polling events starting...")
 
 		query := makeFilterQuery(li.contracts)
 
@@ -71,81 +90,79 @@ func (li *Listener) pollEventsAndHeaders(ctx context.Context, start *HeaderID) e
 		}
 	}
 
-	li.log.Info("Polling headers started")
+	headerSyncer := syncer.NewSyncer(35, syncer.NewHeaderLoader(li.conn.client), headers, li.log)
 
-	currentBlock := uint64(start.Number)
-	newestBlock := uint64(0)
-	subscription, err := li.conn.client.SubscribeNewHead(ctx, headers)
+	li.log.Info("Syncing headers starting...")
+	err := headerSyncer.StartSync(headerCtx, headerEg, initBlockHeight)
 	if err != nil {
-		li.log.WithError(err).Error("Failed to subscribe to new headers")
+		li.log.WithError(err).Error("Failed to start header sync")
 		return err
 	}
-	headersSubscriptionErr = subscription.Err()
 
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return li.onDone(ctx)
+		case <-headerCtx.Done():
+			return li.onDone(ctx)
 		case err := <-eventsSubscriptionErr:
 			li.log.WithError(err).Error("Events subscription terminated")
-			return err
-		case err := <-headersSubscriptionErr:
-			li.log.WithError(err).Error("Headers subscription terminated")
+			li.onDone(ctx)
 			return err
 		case event := <-events:
 			li.log.WithFields(logrus.Fields{
 				"address":     event.Address.Hex(),
-				"txHash":      event.TxHash.Hex(),
+				"blockHash":   event.BlockHash.Hex(),
 				"blockNumber": event.BlockNumber,
+				"txHash":      event.TxHash.Hex(),
 			}).Info("Witnessed transaction for application")
-
-			msg, err := MakeMessageFromEvent(event, li.log)
-			if err != nil {
-				li.log.WithFields(logrus.Fields{
-					"address":     event.Address.Hex(),
-					"txHash":      event.TxHash.Hex(),
-					"blockNumber": event.BlockNumber,
-				}).Error("Failed to generate message from ethereum event")
-			} else {
-				li.messages <- *msg
-			}
+			li.forwardEvent(ctx, hcs, &event)
 		case gethheader := <-headers:
-			blockNumber := gethheader.Number.Uint64()
-			newestBlock = blockNumber
-			li.log.WithFields(logrus.Fields{
-				"blockNumber": blockNumber,
-			}).Info("Witnessed new block header")
-			if blockNumber <= currentBlock+1 {
-				li.forwardHeader(gethheader)
-				currentBlock = blockNumber
-			}
-		default:
-			if currentBlock == newestBlock {
-				continue
-			}
-			gethheader, err := li.conn.client.HeaderByNumber(ctx, new(big.Int).SetUint64(currentBlock))
-			if err != nil {
-				li.log.WithFields(logrus.Fields{
-					"blockNumber": currentBlock,
-				}).Error("Failed to retrieve old block header")
-			} else {
-				li.log.WithFields(logrus.Fields{
-					"blockNumber": currentBlock,
-				}).Info("Retrieved old block header")
-				li.forwardHeader(gethheader)
-				currentBlock = currentBlock + 1
-			}
+			li.forwardHeader(hcs, gethheader)
 		}
 	}
 }
 
-func (li *Listener) forwardHeader(gethheader *gethTypes.Header) {
-	header, err := MakeHeaderFromEthHeader(gethheader, li.log)
+func (li *Listener) forwardEvent(ctx context.Context, hcs *HeaderCacheState, event *gethTypes.Log) {
+	receiptTrie, err := hcs.GetReceiptTrie(ctx, event.BlockHash)
 	if err != nil {
 		li.log.WithFields(logrus.Fields{
-			"blockHash":   gethheader.Hash(),
+			"blockHash":   event.BlockHash.Hex(),
+			"blockNumber": event.BlockNumber,
+			"txHash":      event.TxHash.Hex(),
+		}).WithError(err).Error("Failed to get receipt trie for event")
+		return
+	}
+
+	msg, err := MakeMessageFromEvent(event, receiptTrie, li.log)
+	if err != nil {
+		li.log.WithFields(logrus.Fields{
+			"address":     event.Address.Hex(),
+			"blockHash":   event.BlockHash.Hex(),
+			"blockNumber": event.BlockNumber,
+			"txHash":      event.TxHash.Hex(),
+		}).WithError(err).Error("Failed to generate message from ethereum event")
+	} else {
+		li.messages <- *msg
+	}
+}
+
+func (li *Listener) forwardHeader(hcs *HeaderCacheState, gethheader *gethTypes.Header) {
+	cache, err := hcs.GetEthashproofCache(gethheader.Number.Uint64())
+	if err != nil {
+		li.log.WithFields(logrus.Fields{
+			"blockHash":   gethheader.Hash().Hex(),
 			"blockNumber": gethheader.Number,
-		}).Error("Failed to generate header from ethereum header")
+		}).WithError(err).Error("Failed to get ethashproof cache for header")
+		return
+	}
+
+	header, err := MakeHeaderFromEthHeader(gethheader, cache, li.log)
+	if err != nil {
+		li.log.WithFields(logrus.Fields{
+			"blockHash":   gethheader.Hash().Hex(),
+			"blockNumber": gethheader.Number,
+		}).WithError(err).Error("Failed to generate header from ethereum header")
 	} else {
 		li.headers <- *header
 	}
@@ -154,11 +171,18 @@ func (li *Listener) forwardHeader(gethheader *gethTypes.Header) {
 func makeFilterQuery(contracts []Contract) geth.FilterQuery {
 	var addresses []gethCommon.Address
 	var topics []gethCommon.Hash
+	topicSet := make(map[gethCommon.Hash]bool)
 
 	for _, contract := range contracts {
 		addresses = append(addresses, contract.Address)
-		signature := contract.ABI.Events["AppTransfer"].ID.Hex()
-		topics = append(topics, gethCommon.HexToHash(signature))
+		for _, event := range contract.ABI.Events {
+			signature := gethCommon.HexToHash(event.ID.Hex())
+			_, exists := topicSet[signature]
+			if !exists {
+				topics = append(topics, signature)
+				topicSet[signature] = true
+			}
+		}
 	}
 
 	return geth.FilterQuery{
