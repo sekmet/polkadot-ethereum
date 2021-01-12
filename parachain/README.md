@@ -28,26 +28,16 @@ Follow these steps to prepare your local environment for Substrate development.
 
 ### Requirements
 
-The project is currently being developed and is working with the following version of Rust:
-
-```
-stable-x86_64-unknown-linux-gnu (default)
-rustc 1.45.0 (5c1f21c3b 2020-07-13)
-```
-
-#### Simple Method
-
-Install all the required dependencies with a single command (be patient, this can take up to 30
-minutes).
-
-```bash
-curl https://getsubstrate.io -sSf | bash -s -- --fast
-```
-
-#### Manual Method
-
 Find manual setup instructions at the
 [Substrate Developer Hub](https://substrate.dev/docs/en/knowledgebase/getting-started/#manual-installation).
+
+The project currently follows the tip of Substrate master and so following nightly version of Rust is required:
+
+```
+nightly-2021-01-10-x86_64-unknown-linux-gnu (default)
+```
+
+This version is also specified in the `rust-toolchain` file and so it should be installed automatically when running cargo.
 
 ### Dependencies
 
@@ -84,17 +74,9 @@ Edit the generated spec file and replace the following addresses:
       }
 ```
 
-#### Relayer Key
-
-_It is not required to change anything here for local development and testing._
-
-The parachain depends on a external relayer service to forward messages to and from Ethereum. The relayer service is trusted by the parachain. Its identity should be injected into the [GenesisConfig](https://snowfork.github.io/artemis-rust-docs/pallet_verifier/struct.GenesisConfig.html#structfield.key) for the [Verifier](https://snowfork.github.io/artemis-rust-docs/pallet_verifier/index.html) pallet.
-
-The node's baked-in chain spec uses `//Relay` as the relayer's account seed. For reference, see [chain_spec.rs](https://github.com/Snowfork/polkadot-ethereum/blob/main/parachain/node/src/chain_spec.rs#L50).
-
 ### Build
 
-Once the development environment is set up, build the node template. This command will build the
+Once the development environment is set up, build the parachain. This command will build the
 [Wasm](https://substrate.dev/docs/en/knowledgebase/advanced/executor#wasm-execution) and
 [native](https://substrate.dev/docs/en/knowledgebase/advanced/executor#native-execution) code:
 
@@ -104,23 +86,38 @@ cargo build --release
 
 ### Run
 
-Purge any existing dev chain state:
+
+Install `polkadot-launch`:
 
 ```bash
-target/release/artemis-node purge-chain --dev
+git clone https://github.com/paritytech/polkadot-launch.git
+cd polkadot-launch
+yarn global add file:.
 ```
 
-Start a dev chain:
+Build polkadot:
 
 ```bash
-target/release/artemis-node --tmp --dev
+git clone https://github.com/paritytech/polkadot.git
+cd polkadot
+git checkout rococo-v1
+cargo build --release --features=real-overseer
 ```
 
-Or, start a dev chain with a custom chain spec:
+Create a configuration for polkadot-launch by editing `config.json`. You'll need to substitute `<POLKADOT_DIR>` with the location of your polkadot checkout above.
 
 ```bash
-target/release/artemis-node --tmp --spec spec.json
+vim config.json
 ```
+
+Launch polkadot and parachain:
+
+```bash
+polkadot-launch config.json
+```
+
+To view the parachain logs, open another terminal and view the `200.log` file. Note that it will take several minutes for the parachain to start producing blocks.
+
 
 ## Interacting with the chain
 
